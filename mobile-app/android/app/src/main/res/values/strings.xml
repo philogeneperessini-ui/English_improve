@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SpeakMate</string>
+    <string name="title_activity_main">SpeakMate</string>
+    <string name="package_name">com.speakmate.english</string>
+    <string name="custom_url_scheme">com.speakmate.english</string>
+</resources>
