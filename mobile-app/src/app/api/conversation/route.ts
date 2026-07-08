@@ -106,15 +106,23 @@ export async function POST(request: Request) {
       signal: AbortSignal.timeout(60_000),
     });
 
-    if (!response.ok) throw new Error(`MiniMax request failed with ${response.status}`);
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(`MiniMax HTTP ${response.status}: ${errorBody.slice(0, 300)}`);
+    }
     const payload = await response.json();
     const content = payload?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error(`MiniMax 返回为空。完整响应: ${JSON.stringify(payload).slice(0, 300)}`);
+    }
     const result = responseSchema.parse(extractJson(content));
     return NextResponse.json({ ...result, source: "minimax" });
-  } catch {
+  } catch (cause) {
+    // 把真实失败原因透传给前端，便于诊断。仍降级到演示回复，不阻塞对话。
+    const reason = cause instanceof Error ? cause.message : String(cause);
     return NextResponse.json({
       ...createDemoReply(scenario, latestUserMessage),
-      notice: "MiniMax 暂时不可用，本轮使用演示回复。",
+      notice: `MiniMax 调用失败，本轮使用演示回复。原因：${reason}`,
     });
   }
 }

@@ -234,6 +234,8 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
       };
       setMessages((current) => [...current, assistantMessage]);
       if (autoSpeak) speak(result.reply);
+      // 显示降级提示（如 MiniMax 失败的原因），便于诊断
+      if (result.notice) setError(result.notice);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "对话请求失败，请稍后重试。 ");
     } finally {
