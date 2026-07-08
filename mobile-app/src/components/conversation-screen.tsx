@@ -8,11 +8,13 @@ import {
   RefreshCw,
   Send,
   Sparkles,
+  Square,
   Volume2,
   VolumeX,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
+import { useRecorder } from "@/lib/use-recorder";
 
 type ScenarioId = "daily" | "travel" | "work" | "ideas";
 
@@ -93,12 +95,14 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
   const [draft, setDraft] = useState("");
   const [interim, setInterim] = useState("");
   const [listening, setListening] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const [sending, setSending] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [error, setError] = useState("");
   const recognitionRef = useRef<Recognition | null>(null);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const recorder = useRecorder();
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -108,6 +112,8 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     recognitionRef.current?.stop();
     void nativeRecognitionRef.current?.stop();
     window.speechSynthesis?.cancel();
+    recorder.reset();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const speak = (text: string) => {
@@ -124,23 +130,60 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
     window.speechSynthesis?.cancel();
+    recorder.reset();
     setScenario(nextScenario);
     setMessages([firstMessage(nextScenario)]);
     setDraft("");
     setInterim("");
     setError("");
+    setTranscribing(false);
   };
 
-  const startListening = async () => {
-    if (listening) {
+  // 把音频上传服务端转写。成功追加到草稿，失败给出可手打的提示。
+  const transcribeAndFill = async (audio: Blob) => {
+    setTranscribing(true);
+    setError("");
+    try {
+      const form = new FormData();
+      form.append("file", audio, "audio.webm");
+      const response = await fetch("/api/transcribe", { method: "POST", body: form });
+      const result = (await response.json()) as { text?: string; error?: string };
+      const text = (result.text || "").trim();
+      if (text) {
+        setDraft((current) => `${current} ${text}`.trim());
+      } else {
+        setError(result.error || "没有听清楚，可以再试一次或直接打字。");
+      }
+    } catch {
+      setError("语音转写失败，可以再试一次或直接打字。");
+    } finally {
+      setTranscribing(false);
+    }
+  };
+
+  const toggleListening = async () => {
+    // 正在录音/识别中 → 停止
+    if (listening || recorder.recording) {
+      // 浏览器实时识别
       recognitionRef.current?.stop();
-      await nativeRecognitionRef.current?.stop();
-      nativeRecognitionRef.current = null;
+      // 原生识别
+      if (nativeRecognitionRef.current) {
+        void nativeRecognitionRef.current.stop();
+        nativeRecognitionRef.current = null;
+      }
+      // MediaRecorder + 服务端 ASR 路径：停止录音后上传转写
+      if (recorder.recording) {
+        const result = await recorder.stop();
+        if (result) await transcribeAndFill(result.audio);
+      }
+      setListening(false);
       return;
     }
 
     setError("");
     setInterim("");
+
+    // 优先用原生识别（APK 内可用，体验最实时）
     setListening(true);
     try {
       const nativeRecognition = await startNativeSpeech({
@@ -154,55 +197,69 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
         return;
       }
     } catch (cause) {
-      setListening(false);
-      setError(cause instanceof Error ? cause.message : "语音识别启动失败。 ");
-      return;
+      setError(cause instanceof Error ? cause.message : "语音识别启动失败。");
     }
 
+    // 浏览器 Web Speech API：实时转写，但国内 Chrome 通常连不上 Google 服务
     const recognitionWindow = window as typeof window & {
       SpeechRecognition?: RecognitionConstructor;
       webkitSpeechRecognition?: RecognitionConstructor;
     };
     const RecognitionApi = recognitionWindow.SpeechRecognition || recognitionWindow.webkitSpeechRecognition;
-    if (!RecognitionApi) {
-      setError("当前浏览器不支持语音转写，请使用下方文字输入。 ");
-      setListening(false);
+    if (RecognitionApi) {
+      const recognition = new RecognitionApi();
+      recognition.lang = "en-US";
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.onresult = (event) => {
+        let finalText = "";
+        let interimText = "";
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          if (result.isFinal) finalText += result[0].transcript;
+          else interimText += result[0].transcript;
+        }
+        if (finalText) setDraft((current) => `${current} ${finalText}`.trim());
+        setInterim(interimText);
+      };
+      recognition.onend = () => {
+        setListening(false);
+        setInterim("");
+      };
+      recognition.onerror = () => {
+        setListening(false);
+        setInterim("");
+        // 浏览器识别失败（最常见是国内网络）→ 自动切到 MediaRecorder + 服务端 ASR
+        void startRecorder();
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
       return;
     }
-    const recognition = new RecognitionApi();
-    recognition.lang = "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.onresult = (event) => {
-      let finalText = "";
-      let interimText = "";
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        if (result.isFinal) finalText += result[0].transcript;
-        else interimText += result[0].transcript;
-      }
-      if (finalText) setDraft((current) => `${current} ${finalText}`.trim());
-      setInterim(interimText);
-    };
-    recognition.onend = () => {
-      setListening(false);
-      setInterim("");
-    };
-    recognition.onerror = () => {
-      setListening(false);
-      setError("没有听清楚，请重试或使用文字输入。 ");
-    };
-    recognitionRef.current = recognition;
-    recognition.start();
+
+    // 没有浏览器识别 → 直接走录音 + 服务端 ASR（国内浏览器的主要路径）
+    setListening(false);
+    await startRecorder();
+  };
+
+  // 启动 MediaRecorder 录音；停止后再上传服务端转写。
+  const startRecorder = async () => {
+    const ok = await recorder.start();
+    if (ok) setListening(true);
   };
 
   const sendMessage = async () => {
     const content = `${draft} ${interim}`.trim();
-    if (!content || sending) return;
+    if (!content || sending || transcribing) return;
 
     recognitionRef.current?.stop();
     await nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
+    if (recorder.recording) {
+      const stopped = await recorder.stop();
+      // 丢弃刚录的尾巴，不追加文字，避免影响发送
+      void stopped;
+    }
     setListening(false);
     setDraft("");
     setInterim("");
@@ -309,6 +366,11 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
 
       <div className="border-t border-[var(--line)] bg-white p-3">
         {error && <p className="mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700">{error}</p>}
+        {transcribing && (
+          <p className="mb-2 flex items-center gap-1.5 rounded-xl bg-[var(--mint)] px-3 py-2 text-xs text-[var(--green)]">
+            <LoaderCircle size={12} className="animate-spin" /> 正在把语音转成文字…
+          </p>
+        )}
         {interim && <p className="mb-2 rounded-xl bg-[var(--paper)] px-3 py-2 text-xs italic text-[var(--muted)]">{interim}</p>}
         <div className="flex items-end gap-2">
           <button type="button" onClick={() => setAutoSpeak((value) => !value)} className={`grid size-11 shrink-0 place-items-center rounded-2xl ${autoSpeak ? "bg-[var(--mint)] text-[var(--green)]" : "bg-[var(--paper)] text-[var(--muted)]"}`} aria-label={autoSpeak ? "关闭自动朗读" : "开启自动朗读"}>
@@ -323,15 +385,15 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
                 sendMessage();
               }
             }}
-            placeholder={listening ? "Listening…" : "Speak or type in English…"}
+            placeholder={listening || recorder.recording ? "Listening… 再按一下麦克风结束" : "Speak or type in English…"}
             rows={1}
             className="max-h-28 min-h-11 flex-1 resize-none rounded-2xl bg-[var(--paper)] px-4 py-3 text-[15px] outline-none ring-[var(--mint)] focus:ring-2"
           />
-          <button type="button" onClick={startListening} className={`grid size-11 shrink-0 place-items-center rounded-2xl ${listening ? "bg-[var(--coral)] text-white" : "bg-[var(--mint)] text-[var(--green)]"}`} aria-label={listening ? "停止语音输入" : "开始语音输入"}>
-            <Mic size={19} />
+          <button type="button" onClick={toggleListening} disabled={transcribing} className={`grid size-11 shrink-0 place-items-center rounded-2xl disabled:opacity-50 ${listening || recorder.recording ? "recording-ring bg-[var(--coral)] text-white" : "bg-[var(--mint)] text-[var(--green)]"}`} aria-label={listening || recorder.recording ? "停止语音输入" : "开始语音输入"}>
+            {listening || recorder.recording ? <Square size={17} fill="currentColor" /> : <Mic size={19} />}
           </button>
-          <button type="button" onClick={sendMessage} disabled={sending || (!draft.trim() && !interim.trim())} className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[var(--green)] text-white disabled:opacity-35" aria-label="发送消息">
-            <Send size={18} />
+          <button type="button" onClick={sendMessage} disabled={sending || transcribing || (!draft.trim() && !interim.trim())} className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[var(--green)] text-white disabled:opacity-35" aria-label="发送消息">
+            {sending ? <LoaderCircle size={18} className="animate-spin" /> : <Send size={18} />}
           </button>
         </div>
       </div>

@@ -31,6 +31,7 @@ import { getDailyQuestion, partTips, questions } from "@/lib/questions";
 import { analyzeSpeech } from "@/lib/metrics";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
 import { deletePractice, listPractices, savePractice } from "@/lib/storage";
+import { useRecorder } from "@/lib/use-recorder";
 import type { Evaluation, PracticeRecord, Question, ScoreKey, SpeechMetrics } from "@/lib/types";
 
 type Tab = "home" | "practice" | "conversation" | "history";
@@ -463,152 +464,170 @@ function QuestionCard({ question, onStart }: { question: Question; onStart: () =
 }
 
 function RecorderScreen({ question, onCancel, onComplete }: { question: Question; onCancel: () => void; onComplete: (result: { transcript: string; audio: Blob; durationSeconds: number; pauseDurationsMs: number[] }) => void }) {
-  const [seconds, setSeconds] = useState(0);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [finalTranscript, setFinalTranscript] = useState("");
-  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState("");
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const secondsRef = useRef(0);
   const finalTranscriptRef = useRef("");
-  const recordingRef = useRef(false);
   const pauseStartedAtRef = useRef<number | null>(null);
   const pauseDurationsRef = useRef<number[]>([]);
+  const completedRef = useRef(false);
+  const recorder = useRecorder();
 
-  const cleanup = useCallback(() => {
-    recordingRef.current = false;
-    if (timerRef.current) clearInterval(timerRef.current);
+  const cleanupRecognition = useCallback(() => {
     recognitionRef.current?.stop();
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
-    if (mediaRecorderRef.current?.state !== "inactive") {
-      mediaRecorderRef.current?.stop();
-    }
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    timerRef.current = null;
   }, []);
 
-  useEffect(() => cleanup, [cleanup]);
+  useEffect(() => {
+    return () => {
+      cleanupRecognition();
+      recorder.reset();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const startRecording = async () => {
+  // 上传音频到服务端转写（ASR 兜底路径）。国内浏览器的主要转写方式。
+  const transcribeAudio = async (audio: Blob): Promise<string> => {
+    const form = new FormData();
+    form.append("file", audio, "audio.webm");
+    const response = await fetch("/api/transcribe", { method: "POST", body: form });
+    const result = (await response.json()) as { text?: string; error?: string };
+    if (!response.ok && !result.text) {
+      throw new Error(result.error || "语音转写失败。");
+    }
+    return (result.text || "").trim();
+  };
+
+  const finish = async (audio: Blob, durationSeconds: number) => {
+    if (completedRef.current) return;
+    completedRef.current = true;
+    cleanupRecognition();
+    const realtimeTranscript = `${finalTranscriptRef.current}${interimTranscript}`.trim();
+    // 实时识别已经拿到文字 → 直接用，不必再上传（省一次请求、更省隐私）
+    if (realtimeTranscript.length >= 3) {
+      onComplete({ transcript: realtimeTranscript, audio, durationSeconds, pauseDurationsMs: pauseDurationsRef.current });
+      return;
+    }
+    // 没有实时文字 → 上传服务端 ASR 转写
+    setTranscribing(true);
+    setError("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-      streamRef.current = stream;
-      const preferredType = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((type) => MediaRecorder.isTypeSupported(type));
-      const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
-      mediaRecorderRef.current = recorder;
-      chunksRef.current = [];
-      pauseDurationsRef.current = [];
-      pauseStartedAtRef.current = null;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
-      };
-      recorder.start(500);
-      recordingRef.current = true;
-
-      let nativeRecognition: NativeSpeechController | null = null;
-      try {
-        nativeRecognition = await startNativeSpeech({
-          continuous: true,
-          onFinal: (text) => {
-            finalTranscriptRef.current += `${text.trim()} `;
-            setFinalTranscript(finalTranscriptRef.current);
-          },
-          onInterim: setInterimTranscript,
-          onError: setError,
-        });
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "语音转写暂时不可用，可在下一步手动修改文字。");
-      }
-      nativeRecognitionRef.current = nativeRecognition;
-
-      const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!nativeRecognition && Recognition) {
-        const recognition = new Recognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = "en-US";
-        recognition.onresult = (event) => {
-          let interim = "";
-          let appended = "";
-          for (let index = event.resultIndex; index < event.results.length; index += 1) {
-            const result = event.results[index];
-            if (result.isFinal) appended += `${result[0].transcript.trim()} `;
-            else interim += result[0].transcript;
-          }
-          if (appended) {
-            finalTranscriptRef.current += appended;
-            setFinalTranscript(finalTranscriptRef.current);
-          }
-          setInterimTranscript(interim);
-        };
-        recognition.onend = () => {
-          if (recordingRef.current) {
-            try {
-              recognition.start();
-            } catch {
-              // Some browsers restart recognition themselves after short pauses.
-            }
-          }
-        };
-        recognition.onspeechend = () => {
-          pauseStartedAtRef.current = Date.now();
-        };
-        recognition.onspeechstart = () => {
-          if (pauseStartedAtRef.current) {
-            const pause = Date.now() - pauseStartedAtRef.current;
-            if (pause >= 700) pauseDurationsRef.current.push(pause);
-          }
-          pauseStartedAtRef.current = null;
-        };
-        recognitionRef.current = recognition;
-        recognition.start();
-      }
-
-      setRecording(true);
-      timerRef.current = setInterval(() => {
-        secondsRef.current += 1;
-        setSeconds(secondsRef.current);
-      }, 1000);
-    } catch {
-      setError("无法访问麦克风。请在浏览器设置中允许麦克风权限。 ");
+      const text = await transcribeAudio(audio);
+      onComplete({
+        transcript: text,
+        audio,
+        durationSeconds,
+        pauseDurationsMs: pauseDurationsRef.current,
+      });
+    } catch (cause) {
+      // ASR 失败：仍然进入 review，transcript 为空，用户可在下一步手动输入
+      setTranscribing(false);
+      completedRef.current = false;
+      setError(cause instanceof Error ? cause.message + " 可在下一步手动输入文字。" : "语音转写失败，可在下一步手动输入文字。");
     }
   };
 
-  const stopRecording = () => {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state === "inactive") return;
-    setRecording(false);
-    recordingRef.current = false;
-    if (timerRef.current) clearInterval(timerRef.current);
-    recognitionRef.current?.stop();
-    void nativeRecognitionRef.current?.stop();
-    nativeRecognitionRef.current = null;
-    timerRef.current = null;
-    recorder.onstop = () => {
-      const audio = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      onComplete({
-        transcript: `${finalTranscriptRef.current}${interimTranscript}`.trim(),
-        audio,
-        durationSeconds: secondsRef.current,
-        pauseDurationsMs: pauseDurationsRef.current,
+  const startRecording = async () => {
+    setError("");
+    setInterimTranscript("");
+    setFinalTranscript("");
+    finalTranscriptRef.current = "";
+    pauseDurationsRef.current = [];
+    pauseStartedAtRef.current = null;
+    completedRef.current = false;
+
+    const ok = await recorder.start();
+    if (!ok) {
+      setError(recorder.error || "无法访问麦克风。请在浏览器设置中允许麦克风权限。");
+      return;
+    }
+
+    // 优先用原生识别（APK 内）做实时转写
+    try {
+      const nativeRecognition = await startNativeSpeech({
+        continuous: true,
+        onFinal: (text) => {
+          finalTranscriptRef.current += `${text.trim()} `;
+          setFinalTranscript(finalTranscriptRef.current);
+        },
+        onInterim: setInterimTranscript,
+        onError: setError,
       });
-    };
-    recorder.stop();
+      if (nativeRecognition) {
+        nativeRecognitionRef.current = nativeRecognition;
+        return;
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "语音转写暂时不可用，可在下一步手动修改文字。");
+    }
+
+    // 浏览器 Web Speech API 实时转写（国内 Chrome 常连不上，会触发 onerror）
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (Recognition) {
+      const recognition = new Recognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+      recognition.onresult = (event) => {
+        let interim = "";
+        let appended = "";
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          if (result.isFinal) appended += `${result[0].transcript.trim()} `;
+          else interim += result[0].transcript;
+        }
+        if (appended) {
+          finalTranscriptRef.current += appended;
+          setFinalTranscript(finalTranscriptRef.current);
+        }
+        setInterimTranscript(interim);
+      };
+      recognition.onend = () => {
+        if (!completedRef.current && recorder.recording) {
+          try {
+            recognition.start();
+          } catch {
+            // Some browsers restart recognition themselves after short pauses.
+          }
+        }
+      };
+      recognition.onspeechend = () => {
+        pauseStartedAtRef.current = Date.now();
+      };
+      recognition.onspeechstart = () => {
+        if (pauseStartedAtRef.current) {
+          const pause = Date.now() - pauseStartedAtRef.current;
+          if (pause >= 700) pauseDurationsRef.current.push(pause);
+        }
+        pauseStartedAtRef.current = null;
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
+    }
+    // 若两者都不可用，停止录音时会自动走服务端 ASR 兜底，无需在此处理。
+  };
+
+  const stopRecording = async () => {
+    if (transcribing || completedRef.current) return;
+    cleanupRecognition();
+    const result = await recorder.stop();
+    if (!result) {
+      setError("录音失败，请重试。");
+      return;
+    }
+    await finish(result.audio, result.durationSeconds);
   };
 
   return (
     <section className="flex min-h-[72dvh] flex-col rounded-[30px] bg-[var(--green)] p-5 text-white">
       <div className="flex items-center justify-between">
-        <button type="button" onClick={() => { cleanup(); onCancel(); }} className="grid size-10 place-items-center rounded-full bg-white/10"><X size={20} /></button>
+        <button type="button" onClick={() => { cleanupRecognition(); recorder.reset(); onCancel(); }} className="grid size-10 place-items-center rounded-full bg-white/10"><X size={20} /></button>
         <span className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold">IELTS PART {question.part}</span>
-        <span className="w-10 text-right font-mono text-sm">{formatDuration(seconds)}</span>
+        <span className="w-10 text-right font-mono text-sm">{formatDuration(recorder.seconds)}</span>
       </div>
       <div className="mt-8 rounded-3xl bg-white/[0.07] p-5 ring-1 ring-white/10">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/45">Question</p>
@@ -616,12 +635,12 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
       </div>
       <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
         <div className="relative">
-          <button type="button" onClick={recording ? stopRecording : startRecording} className={`relative z-10 grid size-24 place-items-center rounded-full transition active:scale-95 ${recording ? "recording-ring bg-[var(--coral)]" : "bg-[var(--lime)] text-[var(--ink)]"}`} aria-label={recording ? "停止录音" : "开始录音"}>
-            {recording ? <Square size={30} fill="currentColor" /> : <Mic size={34} />}
+          <button type="button" onClick={recorder.recording ? stopRecording : startRecording} disabled={transcribing} className={`relative z-10 grid size-24 place-items-center rounded-full transition active:scale-95 disabled:opacity-60 ${recorder.recording ? "recording-ring bg-[var(--coral)]" : "bg-[var(--lime)] text-[var(--ink)]"}`} aria-label={recorder.recording ? "停止录音" : "开始录音"}>
+            {transcribing ? <LoaderCircle size={30} className="animate-spin" /> : recorder.recording ? <Square size={30} fill="currentColor" /> : <Mic size={34} />}
           </button>
         </div>
-        <p className="mt-7 text-lg font-bold">{recording ? "正在聆听…" : "准备好后点击麦克风"}</p>
-        <p className="mt-2 max-w-xs text-sm leading-relaxed text-white/50">{recording ? "自然回答即可；想词时安静停顿，比连续使用填充词更好。" : "录音仅保存在当前设备，提交评价时只发送转写文字。"}</p>
+        <p className="mt-7 text-lg font-bold">{transcribing ? "正在把语音转成文字…" : recorder.recording ? "正在聆听…" : "准备好后点击麦克风"}</p>
+        <p className="mt-2 max-w-xs text-sm leading-relaxed text-white/50">{transcribing ? "请稍候，识别完成后会自动进入下一步。" : recorder.recording ? "自然回答即可；想词时安静停顿，比连续使用填充词更好。" : "录音仅保存在当前设备，转写由服务端完成，只发送录音用于识别。"}</p>
         {(finalTranscript || interimTranscript) && <p className="mt-5 line-clamp-3 max-w-sm rounded-2xl bg-black/10 p-3 text-sm leading-relaxed text-white/65">{finalTranscript}<span className="text-white/35">{interimTranscript}</span></p>}
         {error && <p className="mt-5 rounded-2xl bg-red-400/15 p-3 text-sm text-red-100">{error}</p>}
       </div>
