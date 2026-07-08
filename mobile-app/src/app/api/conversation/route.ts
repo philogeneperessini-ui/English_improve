@@ -36,6 +36,21 @@ const scenarioPrompts = {
   ideas: "讨论观点和社会话题，训练解释、比较和举例",
 };
 
+/**
+ * 当模型没有返回合法 JSON、而是自然语言时，把输出清理成纯文本回复。
+ * 剥离 <think> 思考块、markdown 代码围栏、残留的 JSON 键名等。
+ */
+function stripToPlainText(text: string): string {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  out = out.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1");
+  // 如果碰巧是 {"reply": "..."} 这种，提取里面的值
+  const replyMatch = out.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (replyMatch) return replyMatch[1].replace(/\\"/g, '"').replace(/\\n/g, " ");
+  // 去掉行首的 JSON 残留键名，如 reply:、{ "reply":
+  out = out.replace(/^\s*[\[{]"?reply"?\s*:?\s*/i, "").replace(/[}\]]\s*$/, "");
+  return out.trim();
+}
+
 function createDemoReply(scenario: keyof typeof scenarioPrompts, lastMessage: string) {
   const replies = {
     daily: `That sounds interesting. What do you enjoy most about it, and why?`,
@@ -115,8 +130,25 @@ export async function POST(request: Request) {
     if (!content) {
       throw new Error(`MiniMax 返回为空。完整响应: ${JSON.stringify(payload).slice(0, 300)}`);
     }
-    const result = responseSchema.parse(extractJson(content));
-    return NextResponse.json({ ...result, source: "minimax" });
+
+    // 优先尝试按 JSON 解析（理想情况）
+    try {
+      const result = responseSchema.parse(extractJson(content));
+      return NextResponse.json({ ...result, source: "minimax" });
+    } catch {
+      // M3 等推理模型经常无视 JSON 指令、直接用自然语言回复。
+      // 这种情况下把纯文本直接当回复用，不强制 JSON——对话场景纯文本本就合理。
+      const reply = stripToPlainText(content).trim();
+      if (reply.length < 2) {
+        throw new Error(`MiniMax 返回内容无法解析且过短。原始返回(前300字): ${content.slice(0, 300)}`);
+      }
+      return NextResponse.json({
+        reply,
+        correction: null,
+        source: "minimax" as const,
+        _raw: content.slice(0, 200),
+      });
+    }
   } catch (cause) {
     // 把真实失败原因透传给前端，便于诊断。仍降级到演示回复，不阻塞对话。
     const reason = cause instanceof Error ? cause.message : String(cause);

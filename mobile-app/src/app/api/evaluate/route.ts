@@ -85,11 +85,15 @@ export async function POST(request: Request) {
     });
 
     if (!response.ok) {
-      throw new Error(`MiniMax request failed with ${response.status}`);
+      const errorBody = await response.text().catch(() => "");
+      throw new Error(`MiniMax HTTP ${response.status}: ${errorBody.slice(0, 300)}`);
     }
 
     const payload = await response.json();
     const content = payload?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error(`MiniMax 返回为空。完整响应: ${JSON.stringify(payload).slice(0, 300)}`);
+    }
     const evaluation = evaluationSchema.parse(extractJson(content));
 
     return NextResponse.json({ ...evaluation, source: "minimax" });
