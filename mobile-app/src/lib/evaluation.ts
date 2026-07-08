@@ -107,12 +107,69 @@ export function createDemoEvaluation(
   };
 }
 
+/**
+ * 从模型输出中提取 JSON 对象。
+ *
+ * M2.x / M3 是推理模型，返回内容经常包含：
+ *  - `<think>...</think>` 思考标签
+ *  - 思考过程里出现的零散 `{` `}`（会干扰朴素的 indexOf 截取）
+ *  - ```json ... ``` markdown 代码块包裹的 JSON
+ *  - 裸文本思考 + 末尾真正的 JSON 答案
+ *
+ * 策略：先剥离思考标签与 markdown 围栏，再用括号配平从最后一个 `{` 起
+ * 向前匹配出完整对象，逐个尝试 JSON.parse。这样即使前面有思考残留也能命中。
+ */
 export function extractJson(text: string) {
-  const withoutThinking = text.replace(/<think>[\s\S]*?<\/think>/g, "");
-  const start = withoutThinking.indexOf("{");
-  const end = withoutThinking.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("MiniMax did not return a JSON object.");
+  // 1. 去掉 <think>...</think> 思考块
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  // 2. 去掉 markdown 代码围栏 ```json ... ``` 或 ``` ... ```
+  cleaned = cleaned.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1");
+
+  // 3. 从后往前找每个 `{`，用括号配平尝试解析出完整 JSON 对象
+  for (let i = cleaned.length - 1; i >= 0; i -= 1) {
+    if (cleaned[i] !== "{") continue;
+    const candidate = sliceBalancedJson(cleaned, i);
+    if (candidate === null) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // 这个 { 配平了但不是合法 JSON（可能是思考里的代码片段），继续往前找
+    }
   }
-  return JSON.parse(withoutThinking.slice(start, end + 1));
+  throw new Error("MiniMax did not return a JSON object.");
+}
+
+/**
+ * 从 start 位置（必须是 `{`）开始，按括号配平截取一段完整 JSON。
+ * 注意字符串内的括号和转义。配平失败返回 null。
+ */
+function sliceBalancedJson(source: string, start: number): string | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const char = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, i + 1);
+      }
+      if (depth < 0) return null;
+    }
+  }
+  return null;
 }
