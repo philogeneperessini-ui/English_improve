@@ -32,27 +32,6 @@ type ChatMessage = {
   source?: "demo" | "minimax";
 };
 
-type RecognitionResultEvent = Event & {
-  resultIndex: number;
-  results: ArrayLike<{
-    isFinal: boolean;
-    0: { transcript: string };
-  }>;
-};
-
-type Recognition = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: RecognitionResultEvent) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-};
-
-type RecognitionConstructor = new () => Recognition;
-
 const scenarios: Array<{ id: ScenarioId; label: string; subtitle: string; greeting: string }> = [
   {
     id: "daily",
@@ -99,7 +78,6 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
   const [sending, setSending] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [error, setError] = useState("");
-  const recognitionRef = useRef<Recognition | null>(null);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const recorder = useRecorder();
@@ -109,7 +87,6 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
   }, [messages, sending]);
 
   useEffect(() => () => {
-    recognitionRef.current?.stop();
     void nativeRecognitionRef.current?.stop();
     window.speechSynthesis?.cancel();
     recorder.reset();
@@ -126,7 +103,6 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
   };
 
   const changeScenario = (nextScenario: ScenarioId) => {
-    recognitionRef.current?.stop();
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
     window.speechSynthesis?.cancel();
@@ -152,10 +128,10 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
       if (text) {
         setDraft((current) => `${current} ${text}`.trim());
       } else {
-        setError(result.error || "没有听清楚，可以再试一次或直接打字。");
+        setError(result.error || `没有听清楚（HTTP ${response.status}），可以再试一次或直接打字。`);
       }
-    } catch {
-      setError("语音转写失败，可以再试一次或直接打字。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "语音转写失败，可以再试一次或直接打字。");
     } finally {
       setTranscribing(false);
     }
@@ -165,7 +141,6 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     // 正在录音/识别中 → 停止
     if (listening || recorder.recording) {
       // 浏览器实时识别
-      recognitionRef.current?.stop();
       // 原生识别
       if (nativeRecognitionRef.current) {
         void nativeRecognitionRef.current.stop();
@@ -183,62 +158,29 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     setError("");
     setInterim("");
 
-    // 优先用原生识别（APK 内可用，体验最实时）
-    setListening(true);
-    try {
-      const nativeRecognition = await startNativeSpeech({
-        onFinal: (text) => setDraft((current) => `${current} ${text}`.trim()),
-        onInterim: setInterim,
-        onListeningChange: setListening,
-        onError: setError,
-      });
-      if (nativeRecognition) {
-        nativeRecognitionRef.current = nativeRecognition;
-        return;
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "语音识别启动失败。");
-    }
-
-    // 浏览器 Web Speech API：实时转写，但国内 Chrome 通常连不上 Google 服务
-    const recognitionWindow = window as typeof window & {
-      SpeechRecognition?: RecognitionConstructor;
-      webkitSpeechRecognition?: RecognitionConstructor;
-    };
-    const RecognitionApi = recognitionWindow.SpeechRecognition || recognitionWindow.webkitSpeechRecognition;
-    if (RecognitionApi) {
-      const recognition = new RecognitionApi();
-      recognition.lang = "en-US";
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.onresult = (event) => {
-        let finalText = "";
-        let interimText = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result.isFinal) finalText += result[0].transcript;
-          else interimText += result[0].transcript;
+    // APK 内优先用原生识别（体验最实时，不消耗服务端 ASR 额度）
+    if (typeof window !== "undefined" && "Capacitor" in window) {
+      setListening(true);
+      try {
+        const nativeRecognition = await startNativeSpeech({
+          onFinal: (text) => setDraft((current) => `${current} ${text}`.trim()),
+          onInterim: setInterim,
+          onListeningChange: setListening,
+          onError: setError,
+        });
+        if (nativeRecognition) {
+          nativeRecognitionRef.current = nativeRecognition;
+          return;
         }
-        if (finalText) setDraft((current) => `${current} ${finalText}`.trim());
-        setInterim(interimText);
-      };
-      recognition.onend = () => {
-        setListening(false);
-        setInterim("");
-      };
-      recognition.onerror = () => {
-        setListening(false);
-        setInterim("");
-        // 浏览器识别失败（最常见是国内网络）→ 自动切到 MediaRecorder + 服务端 ASR
-        void startRecorder();
-      };
-      recognitionRef.current = recognition;
-      recognition.start();
-      return;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "语音识别启动失败。");
+      }
+      setListening(false);
     }
 
-    // 没有浏览器识别 → 直接走录音 + 服务端 ASR（国内浏览器的主要路径）
-    setListening(false);
+    // 浏览器主路径：MediaRecorder 录音 + 服务端 ASR 转写。
+    // 不再默认用 webkitSpeechRecognition——它在手机/国内 Chrome 上经常静默失败，
+    // 既不出文字也不报错，导致体验卡死。录音上传服务端转写更可靠。
     await startRecorder();
   };
 
@@ -252,7 +194,6 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     const content = `${draft} ${interim}`.trim();
     if (!content || sending || transcribing) return;
 
-    recognitionRef.current?.stop();
     await nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
     if (recorder.recording) {

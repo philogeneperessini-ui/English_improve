@@ -37,36 +37,6 @@ import type { Evaluation, PracticeRecord, Question, ScoreKey, SpeechMetrics } fr
 type Tab = "home" | "practice" | "conversation" | "history";
 type PracticeStage = "question" | "recording" | "review" | "loading" | "result";
 
-type SpeechRecognitionEventLike = Event & {
-  resultIndex: number;
-  results: ArrayLike<{
-    isFinal: boolean;
-    0: { transcript: string };
-  }>;
-};
-
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-  onspeechstart: (() => void) | null;
-  onspeechend: (() => void) | null;
-};
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
-
 const scoreLabels: Record<ScoreKey, string> = {
   fluency: "流利度",
   vocabulary: "词汇",
@@ -468,16 +438,13 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
   const [finalTranscript, setFinalTranscript] = useState("");
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState("");
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
   const finalTranscriptRef = useRef("");
-  const pauseStartedAtRef = useRef<number | null>(null);
   const pauseDurationsRef = useRef<number[]>([]);
   const completedRef = useRef(false);
   const recorder = useRecorder();
 
   const cleanupRecognition = useCallback(() => {
-    recognitionRef.current?.stop();
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
   }, []);
@@ -497,7 +464,7 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
     const response = await fetch("/api/transcribe", { method: "POST", body: form });
     const result = (await response.json()) as { text?: string; error?: string };
     if (!response.ok && !result.text) {
-      throw new Error(result.error || "语音转写失败。");
+      throw new Error(result.error || `语音转写失败（HTTP ${response.status}）。`);
     }
     return (result.text || "").trim();
   };
@@ -537,7 +504,6 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
     setFinalTranscript("");
     finalTranscriptRef.current = "";
     pauseDurationsRef.current = [];
-    pauseStartedAtRef.current = null;
     completedRef.current = false;
 
     const ok = await recorder.start();
@@ -546,69 +512,28 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
       return;
     }
 
-    // 优先用原生识别（APK 内）做实时转写
-    try {
-      const nativeRecognition = await startNativeSpeech({
-        continuous: true,
-        onFinal: (text) => {
-          finalTranscriptRef.current += `${text.trim()} `;
-          setFinalTranscript(finalTranscriptRef.current);
-        },
-        onInterim: setInterimTranscript,
-        onError: setError,
-      });
-      if (nativeRecognition) {
-        nativeRecognitionRef.current = nativeRecognition;
-        return;
+    // 仅在 APK 内尝试原生识别做实时转写（省服务端 ASR 额度、体验更实时）。
+    // 浏览器不再使用 webkitSpeechRecognition——它在手机/国内 Chrome 上经常静默失败，
+    // 既不出文字也不报错；浏览器统一在停止录音后走服务端 ASR 转写。
+    if (typeof window !== "undefined" && "Capacitor" in window) {
+      try {
+        const nativeRecognition = await startNativeSpeech({
+          continuous: true,
+          onFinal: (text) => {
+            finalTranscriptRef.current += `${text.trim()} `;
+            setFinalTranscript(finalTranscriptRef.current);
+          },
+          onInterim: setInterimTranscript,
+          onError: setError,
+        });
+        if (nativeRecognition) {
+          nativeRecognitionRef.current = nativeRecognition;
+        }
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "语音转写暂时不可用，可在下一步手动修改文字。");
       }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "语音转写暂时不可用，可在下一步手动修改文字。");
     }
-
-    // 浏览器 Web Speech API 实时转写（国内 Chrome 常连不上，会触发 onerror）
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (Recognition) {
-      const recognition = new Recognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-US";
-      recognition.onresult = (event) => {
-        let interim = "";
-        let appended = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result.isFinal) appended += `${result[0].transcript.trim()} `;
-          else interim += result[0].transcript;
-        }
-        if (appended) {
-          finalTranscriptRef.current += appended;
-          setFinalTranscript(finalTranscriptRef.current);
-        }
-        setInterimTranscript(interim);
-      };
-      recognition.onend = () => {
-        if (!completedRef.current && recorder.recording) {
-          try {
-            recognition.start();
-          } catch {
-            // Some browsers restart recognition themselves after short pauses.
-          }
-        }
-      };
-      recognition.onspeechend = () => {
-        pauseStartedAtRef.current = Date.now();
-      };
-      recognition.onspeechstart = () => {
-        if (pauseStartedAtRef.current) {
-          const pause = Date.now() - pauseStartedAtRef.current;
-          if (pause >= 700) pauseDurationsRef.current.push(pause);
-        }
-        pauseStartedAtRef.current = null;
-      };
-      recognitionRef.current = recognition;
-      recognition.start();
-    }
-    // 若两者都不可用，停止录音时会自动走服务端 ASR 兜底，无需在此处理。
+    // 停止录音时，若没有实时文字，会自动上传服务端 ASR 转写（见 finish）。
   };
 
   const stopRecording = async () => {
