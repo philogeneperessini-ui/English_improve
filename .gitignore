@@ -3,3 +3,6 @@
 .env.local
 .env.*.local
 
+# Editor / agent local files
+.zcode/
+
