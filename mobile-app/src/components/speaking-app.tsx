@@ -30,7 +30,7 @@ import { AuthLogoutButton } from "@/components/auth-gate";
 import { getDailyQuestion, partTips, questions } from "@/lib/questions";
 import { analyzeSpeech } from "@/lib/metrics";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
-import { deletePractice, listPractices, savePractice } from "@/lib/storage";
+import { deletePractice, listConversations, listPractices, savePractice } from "@/lib/storage";
 import { useRecorder } from "@/lib/use-recorder";
 import type { Evaluation, PracticeRecord, Question, ScoreKey, SpeechMetrics } from "@/lib/types";
 
@@ -65,6 +65,7 @@ export function SpeakingApp() {
   const [selectedQuestion, setSelectedQuestion] = useState<Question>(getDailyQuestion());
   const [records, setRecords] = useState<PracticeRecord[]>([]);
   const [activeRecord, setActiveRecord] = useState<PracticeRecord | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | undefined>(undefined);
   const [providerReady, setProviderReady] = useState(false);
 
   const refreshRecords = useCallback(async () => {
@@ -80,6 +81,16 @@ export function SpeakingApp() {
       .then((status) => setProviderReady(Boolean(status.minimaxConfigured)))
       .catch(() => undefined);
   }, [refreshRecords]);
+
+  // 进入对话页时，若没有指定对话，自动加载最近一条（若有）
+  useEffect(() => {
+    if (tab !== "conversation" || activeConversationId !== undefined) return;
+    listConversations()
+      .then((items) => {
+        if (items.length > 0) setActiveConversationId(items[0].id);
+      })
+      .catch(() => undefined);
+  }, [tab, activeConversationId]);
 
   const beginPractice = (question: Question) => {
     setSelectedQuestion(question);
@@ -158,7 +169,13 @@ export function SpeakingApp() {
             }}
           />
         )}
-        {tab === "conversation" && <ConversationScreen onClose={() => setTab("home")} />}
+        {tab === "conversation" && (
+          <ConversationScreen
+            conversationId={activeConversationId}
+            onConversationChange={(id) => setActiveConversationId(id || undefined)}
+            onClose={() => setTab("home")}
+          />
+        )}
       </main>
 
       <nav className="safe-bottom fixed inset-x-0 bottom-0 z-50 mx-auto max-w-[760px] border-t border-black/5 bg-[rgba(255,254,250,0.92)] px-6 pt-2 backdrop-blur-xl md:sticky md:mt-5 md:rounded-3xl md:border">

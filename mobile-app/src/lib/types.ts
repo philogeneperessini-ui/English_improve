@@ -1,5 +1,22 @@
 export type IeltsPart = 1 | 2 | 3;
 
+// 对话相关共享类型（conversation-screen 与 storage 共用）
+export type ScenarioId = "daily" | "travel" | "work" | "ideas";
+
+export type Correction = {
+  original: string;
+  improved: string;
+  tip: string;
+};
+
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  correction?: Correction | null;
+  source?: "demo" | "minimax";
+};
+
 export type Question = {
   id: string;
   part: IeltsPart;
@@ -54,4 +71,12 @@ export type PracticeRecord = {
   evaluation: Evaluation;
   metrics?: SpeechMetrics;
   audio?: Blob;
+};
+
+export type ConversationRecord = {
+  id: string;
+  scenario: ScenarioId;
+  createdAt: string;
+  updatedAt: string;
+  messages: ChatMessage[];
 };

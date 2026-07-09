@@ -2,35 +2,24 @@
 
 import {
   ArrowLeft,
+  History,
   LoaderCircle,
   MessageCircle,
   Mic,
-  RefreshCw,
+  Plus,
   Send,
   Sparkles,
   Square,
+  Trash2,
   Volume2,
   VolumeX,
+  X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
+import { deleteConversation, getConversation, listConversations, saveConversation } from "@/lib/storage";
+import type { ChatMessage, ConversationRecord, ScenarioId } from "@/lib/types";
 import { useRecorder } from "@/lib/use-recorder";
-
-type ScenarioId = "daily" | "travel" | "work" | "ideas";
-
-type Correction = {
-  original: string;
-  improved: string;
-  tip: string;
-};
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  correction?: Correction | null;
-  source?: "demo" | "minimax";
-};
 
 const scenarios: Array<{ id: ScenarioId; label: string; subtitle: string; greeting: string }> = [
   {
@@ -68,7 +57,15 @@ function firstMessage(scenario: ScenarioId): ChatMessage {
   };
 }
 
-export function ConversationScreen({ onClose }: { onClose: () => void }) {
+export function ConversationScreen({
+  conversationId,
+  onConversationChange,
+  onClose,
+}: {
+  conversationId?: string;
+  onConversationChange: (id: string) => void;
+  onClose: () => void;
+}) {
   const [scenario, setScenario] = useState<ScenarioId>("daily");
   const [messages, setMessages] = useState<ChatMessage[]>(() => [firstMessage("daily")]);
   const [draft, setDraft] = useState("");
@@ -78,13 +75,52 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
   const [sending, setSending] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [error, setError] = useState("");
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState<ConversationRecord[]>([]);
+  const [recordId, setRecordId] = useState<string | undefined>(conversationId);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const recorder = useRecorder();
 
+  // 把指定消息列表落库到 IndexedDB，返回（可能的新）记录 id。
+  // 不在 effect 里调用，避免链式渲染；只在对话有实质更新时（如收到 AI 回复）调用。
+  const persistMessages = useCallback(
+    async (currentMessages: ChatMessage[], currentScenario: ScenarioId, id?: string): Promise<string> => {
+      if (currentMessages.length === 0) return id ?? "";
+      const now = new Date().toISOString();
+      const existing = id ? history.find((item) => item.id === id) : undefined;
+      const recordId = id ?? crypto.randomUUID();
+      const record: ConversationRecord = {
+        id: recordId,
+        scenario: currentScenario,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        messages: currentMessages,
+      };
+      await saveConversation(record);
+      if (!id) onConversationChange(recordId);
+      setRecordId(recordId);
+      return recordId;
+    },
+    [history, onConversationChange],
+  );
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, sending]);
+
+  // 初始化：若有 conversationId 则恢复指定对话，否则新建
+  useEffect(() => {
+    if (!conversationId) return;
+    void (async () => {
+      const record = await getConversation(conversationId);
+      if (record) {
+        setScenario(record.scenario);
+        setMessages(record.messages);
+        setRecordId(record.id);
+      }
+    })();
+  }, [conversationId]);
 
   useEffect(() => () => {
     void nativeRecognitionRef.current?.stop();
@@ -92,6 +128,54 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     recorder.reset();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const refreshHistory = useCallback(async () => {
+    const list = await listConversations();
+    setHistory(list);
+  }, []);
+
+  const openHistory = async () => {
+    await refreshHistory();
+    setShowHistory(true);
+  };
+
+  const loadConversation = (id: string) => {
+    const record = history.find((item) => item.id === id);
+    if (record) {
+      void nativeRecognitionRef.current?.stop();
+      nativeRecognitionRef.current = null;
+      recorder.reset();
+      setScenario(record.scenario);
+      setMessages(record.messages);
+      setRecordId(record.id);
+      onConversationChange(record.id);
+      setDraft("");
+      setInterim("");
+      setError("");
+      setShowHistory(false);
+    }
+  };
+
+  const startNewConversation = (nextScenario: ScenarioId) => {
+    void nativeRecognitionRef.current?.stop();
+    nativeRecognitionRef.current = null;
+    window.speechSynthesis?.cancel();
+    recorder.reset();
+    setScenario(nextScenario);
+    setMessages([firstMessage(nextScenario)]);
+    setRecordId(undefined);
+    onConversationChange("");
+    setDraft("");
+    setInterim("");
+    setError("");
+    setTranscribing(false);
+    setShowHistory(false);
+  };
+
+  const removeConversation = async (id: string) => {
+    await deleteConversation(id);
+    await refreshHistory();
+  };
 
   const speak = (text: string) => {
     if (!("speechSynthesis" in window)) return;
@@ -102,17 +186,10 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
     window.speechSynthesis.speak(utterance);
   };
 
+  // 切换场景：保留当前对话内容（用户可能想换话题继续），不强制清空。
   const changeScenario = (nextScenario: ScenarioId) => {
-    void nativeRecognitionRef.current?.stop();
-    nativeRecognitionRef.current = null;
-    window.speechSynthesis?.cancel();
-    recorder.reset();
+    if (nextScenario === scenario) return;
     setScenario(nextScenario);
-    setMessages([firstMessage(nextScenario)]);
-    setDraft("");
-    setInterim("");
-    setError("");
-    setTranscribing(false);
   };
 
   // 把音频上传服务端转写。成功追加到草稿，失败给出可手打的提示。
@@ -232,7 +309,10 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
         correction: result.correction,
         source: result.source,
       };
-      setMessages((current) => [...current, assistantMessage]);
+      const updatedMessages = [...nextMessages, assistantMessage];
+      setMessages(updatedMessages);
+      // 收到 AI 回复后落库（含用户消息 + AI 回复）
+      void persistMessages(updatedMessages, scenario, recordId);
       if (autoSpeak) speak(result.reply);
       // 显示降级提示（如 MiniMax 失败的原因），便于诊断
       if (result.notice) setError(result.notice);
@@ -254,9 +334,14 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">Free conversation</p>
             <h1 className="font-bold">AI 自由对话</h1>
           </div>
-          <button type="button" onClick={() => changeScenario(scenario)} className="grid size-10 place-items-center rounded-full bg-[var(--paper)]" aria-label="重新开始对话">
-            <RefreshCw size={18} />
-          </button>
+          <div className="flex gap-2">
+            <button type="button" onClick={openHistory} className="grid size-10 place-items-center rounded-full bg-[var(--paper)]" aria-label="历史对话">
+              <History size={18} />
+            </button>
+            <button type="button" onClick={() => startNewConversation(scenario)} className="grid size-10 place-items-center rounded-full bg-[var(--paper)]" aria-label="开始新对话">
+              <Plus size={18} />
+            </button>
+          </div>
         </div>
 
         <div className="hide-scrollbar mt-4 flex gap-2 overflow-x-auto">
@@ -272,6 +357,40 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
             </button>
           ))}
         </div>
+
+        {showHistory && (
+          <div className="mt-4 max-h-64 space-y-2 overflow-y-auto rounded-2xl bg-[var(--paper)] p-2">
+            <div className="flex items-center justify-between px-2 py-1">
+              <span className="text-xs font-bold text-[var(--muted)]">历史对话（{history.length}）</span>
+              <button type="button" onClick={() => setShowHistory(false)} className="text-[var(--muted)]" aria-label="关闭历史">
+                <X size={14} />
+              </button>
+            </div>
+            {history.length === 0 && (
+              <p className="px-2 py-3 text-center text-xs text-[var(--muted)]">还没有历史对话</p>
+            )}
+            {history.map((record) => {
+              const scenarioMeta = scenarios.find((item) => item.id === record.scenario);
+              const preview = record.messages.find((message) => message.role === "user")?.content
+                || record.messages[0]?.content
+                || "";
+              return (
+                <div key={record.id} className={`flex items-center gap-2 rounded-xl bg-white p-2 ${record.id === recordId ? "ring-2 ring-[var(--mint)]" : ""}`}>
+                  <button type="button" onClick={() => loadConversation(record.id)} className="min-w-0 flex-1 text-left">
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 rounded-full bg-[var(--mint)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">{scenarioMeta?.label ?? record.scenario}</span>
+                      <span className="truncate text-xs text-[var(--muted)]">{new Date(record.updatedAt).toLocaleString()}</span>
+                    </div>
+                    <p className="mt-1 truncate text-sm">{preview}</p>
+                  </button>
+                  <button type="button" onClick={() => removeConversation(record.id)} className="grid size-8 shrink-0 place-items-center rounded-lg text-[var(--muted)] hover:text-red-500" aria-label="删除对话">
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div className="hide-scrollbar flex-1 space-y-4 overflow-y-auto p-4">
@@ -329,8 +448,8 @@ export function ConversationScreen({ onClose }: { onClose: () => void }) {
               }
             }}
             placeholder={listening || recorder.recording ? "Listening… 再按一下麦克风结束" : "Speak or type in English…"}
-            rows={1}
-            className="max-h-28 min-h-11 flex-1 resize-none rounded-2xl bg-[var(--paper)] px-4 py-3 text-[15px] outline-none ring-[var(--mint)] focus:ring-2"
+            rows={3}
+            className="max-h-40 min-h-[5.5rem] flex-1 resize-none rounded-2xl bg-[var(--paper)] px-4 py-3 text-[15px] leading-6 outline-none ring-[var(--mint)] focus:ring-2"
           />
           <button type="button" onClick={toggleListening} disabled={transcribing} className={`grid size-11 shrink-0 place-items-center rounded-2xl disabled:opacity-50 ${listening || recorder.recording ? "recording-ring bg-[var(--coral)] text-white" : "bg-[var(--mint)] text-[var(--green)]"}`} aria-label={listening || recorder.recording ? "停止语音输入" : "开始语音输入"}>
             {listening || recorder.recording ? <Square size={17} fill="currentColor" /> : <Mic size={19} />}
