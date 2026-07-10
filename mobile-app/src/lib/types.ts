@@ -71,6 +71,7 @@ export type PracticeRecord = {
   evaluation: Evaluation;
   metrics?: SpeechMetrics;
   audio?: Blob;
+  referenceAnswer?: string;
 };
 
 export type ConversationRecord = {

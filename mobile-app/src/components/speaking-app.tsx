@@ -17,6 +17,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  Send,
   Sparkles,
   Square,
   Trash2,
@@ -35,7 +36,7 @@ import { useRecorder } from "@/lib/use-recorder";
 import type { Evaluation, PracticeRecord, Question, ScoreKey, SpeechMetrics } from "@/lib/types";
 
 type Tab = "home" | "practice" | "conversation" | "history";
-type PracticeStage = "question" | "recording" | "review" | "loading" | "result";
+type PracticeStage = "question" | "ai-coach" | "recording" | "review" | "loading" | "result";
 
 const scoreLabels: Record<ScoreKey, string> = {
   fluency: "流利度",
@@ -288,6 +289,7 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
   const [audio, setAudio] = useState<Blob | null>(null);
   const [duration, setDuration] = useState(0);
   const [pauseDurations, setPauseDurations] = useState<number[]>([]);
+  const [referenceAnswer, setReferenceAnswer] = useState<string | undefined>(undefined);
   const [error, setError] = useState("");
   const metrics = useMemo(
     () => analyzeSpeech(transcript, duration, pauseDurations),
@@ -299,6 +301,7 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
     setAudio(null);
     setDuration(0);
     setPauseDurations([]);
+    setReferenceAnswer(undefined);
     setError("");
     onStageChange("question");
   };
@@ -327,6 +330,7 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
         evaluation,
         metrics,
         audio: audio || undefined,
+        referenceAnswer,
       };
       await savePractice(practiceRecord);
       await onSaved(practiceRecord);
@@ -353,11 +357,26 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
     );
   }
 
+  if (stage === "ai-coach") {
+    return (
+      <CoachScreen
+        question={question}
+        referenceAnswer={referenceAnswer}
+        onCancel={() => onStageChange("question")}
+        onUseDraft={(draft) => {
+          setReferenceAnswer(draft);
+          onStageChange("recording");
+        }}
+      />
+    );
+  }
+
   if (stage === "recording") {
     return (
       <RecorderScreen
         question={question}
-        onCancel={() => onStageChange("question")}
+        referenceAnswer={referenceAnswer}
+        onCancel={() => onStageChange(referenceAnswer ? "ai-coach" : "question")}
         onComplete={({ transcript: value, audio: blob, durationSeconds, pauseDurationsMs }) => {
           setTranscript(value);
           setAudio(blob);
@@ -407,7 +426,7 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
           <button key={part} type="button" onClick={() => onQuestionChange(questions.find((item) => item.part === part)!)} className={`shrink-0 rounded-full px-5 py-2.5 text-sm font-bold ${question.part === part ? "bg-[var(--green)] text-white" : "bg-white text-[var(--muted)]"}`}>Part {part}</button>
         ))}
       </div>
-      <QuestionCard question={question} onStart={() => onStageChange("recording")} />
+      <QuestionCard question={question} onStart={(mode) => onStageChange(mode === "coach" ? "ai-coach" : "recording")} />
       <div className="rounded-[26px] border border-[var(--line)] bg-[var(--card)] p-4">
         <p className="mb-3 text-xs font-semibold uppercase tracking-[0.15em] text-[var(--muted)]">More questions</p>
         <div className="space-y-2">
@@ -424,7 +443,7 @@ function PracticeScreen({ question, stage, record, onStageChange, onQuestionChan
   );
 }
 
-function QuestionCard({ question, onStart }: { question: Question; onStart: () => void }) {
+function QuestionCard({ question, onStart }: { question: Question; onStart: (mode: "direct" | "coach") => void }) {
   return (
     <div className="overflow-hidden rounded-[30px] bg-[var(--green)] text-white shadow-[0_18px_50px_rgba(23,63,56,0.15)]">
       <div className="p-6">
@@ -442,15 +461,171 @@ function QuestionCard({ question, onStart }: { question: Question; onStart: () =
           <span className="font-bold text-[var(--lime)]">本题提示：</span> {partTips[question.part][0]}
         </div>
       </div>
-      <div className="flex items-center justify-between bg-white/[0.07] px-6 py-4">
-        <div><p className="text-xs text-white/50">Answer time</p><p className="font-bold">up to {question.answerSeconds} sec</p></div>
-        <button type="button" onClick={onStart} className="flex items-center gap-2 rounded-2xl bg-[var(--lime)] px-5 py-3 font-bold text-[var(--ink)]"><Mic size={18} /> 开始回答</button>
+      <div className="space-y-2 bg-white/[0.07] px-6 py-4">
+        <div><p className="text-xs text-white/50">Answer time · up to {question.answerSeconds} sec</p></div>
+        <div className="flex gap-2">
+          <button type="button" onClick={() => onStart("direct")} className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-[var(--lime)] px-5 py-3 font-bold text-[var(--ink)]"><Mic size={18} /> 直接回答</button>
+          <button type="button" onClick={() => onStart("coach")} className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-white/10 px-5 py-3 font-bold text-white ring-1 ring-white/20"><WandSparkles size={18} /> AI 辅助构思</button>
+        </div>
+        <p className="text-center text-[11px] text-white/40">直接回答 · 或先让 AI 帮你把想法整理成英文范文再练</p>
       </div>
     </div>
   );
 }
 
-function RecorderScreen({ question, onCancel, onComplete }: { question: Question; onCancel: () => void; onComplete: (result: { transcript: string; audio: Blob; durationSeconds: number; pauseDurationsMs: number[] }) => void }) {
+type CoachMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  draft?: string;
+  source?: "demo" | "minimax";
+};
+
+function CoachScreen({ question, referenceAnswer, onCancel, onUseDraft }: { question: Question; referenceAnswer?: string; onCancel: () => void; onUseDraft: (draft: string) => void }) {
+  const [messages, setMessages] = useState<CoachMessage[]>([]);
+  const [draft, setDraft] = useState<string>(referenceAnswer ?? "");
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, sending]);
+
+  const speakEnglish = (text: string) => {
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const sendIdea = async () => {
+    const content = input.trim();
+    if (!content || sending) return;
+    setError("");
+    const userMessage: CoachMessage = { id: crypto.randomUUID(), role: "user", content };
+    const nextMessages = [...messages, userMessage];
+    setMessages(nextMessages);
+    setInput("");
+    setSending(true);
+
+    try {
+      const response = await fetch("/api/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: { part: question.part, topic: question.topic, prompt: question.prompt },
+          messages: nextMessages.map(({ role, content: messageContent }) => ({ role, content: messageContent })),
+        }),
+      });
+      if (!response.ok) throw new Error("请求失败，请稍后重试。");
+      const result = (await response.json()) as { reply: string; draft: string; source: string; error?: string };
+      const assistantMessage: CoachMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: result.reply,
+        draft: result.draft,
+        source: result.source as "demo" | "minimax",
+      };
+      setMessages((current) => [...current, assistantMessage]);
+      if (result.draft) setDraft(result.draft);
+      if (result.error) setError(result.error);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "AI 辅助请求失败，请稍后重试。");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <section className="flex min-h-[72dvh] flex-col rounded-[30px] bg-[var(--card)]">
+      <div className="rounded-t-[30px] bg-[var(--green)] p-5 text-white">
+        <div className="flex items-center justify-between">
+          <button type="button" onClick={onCancel} className="grid size-10 place-items-center rounded-full bg-white/10"><X size={20} /></button>
+          <span className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold">AI 辅助构思 · PART {question.part}</span>
+          <span className="w-10" />
+        </div>
+        <p className="mt-4 text-lg font-medium leading-snug">{question.prompt}</p>
+      </div>
+
+      <div className="hide-scrollbar flex-1 space-y-4 overflow-y-auto p-4">
+        {messages.length === 0 && (
+          <div className="rounded-2xl bg-[var(--paper)] p-4 text-sm leading-relaxed text-[var(--muted)]">
+            <p className="mb-1 font-bold text-[var(--ink)]">用中文说说你想怎么回答</p>
+            <p>例如：「我想说我住在上海，最喜欢这里的生活便利，周末会去博物馆。」AI 会帮你整理成地道英文范文。可以多轮补充修改。</p>
+          </div>
+        )}
+        {messages.map((message) => (
+          <div key={message.id} className={message.role === "user" ? "ml-8" : "mr-4"}>
+            {message.role === "user" ? (
+              <div className="rounded-[22px] rounded-br-md bg-[var(--green)] px-4 py-3 text-[15px] leading-6 text-white">{message.content}</div>
+            ) : (
+              <div className="space-y-2">
+                <p className="px-1 text-sm text-[var(--muted)]">{message.content}{message.source && <span className="ml-1 text-[10px]">· {message.source === "minimax" ? "MiniMax" : "Demo"}</span>}</p>
+                {message.draft && (
+                  <div className="rounded-2xl border border-[var(--line)] bg-white p-4">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-xs font-semibold text-[var(--green)]">英文范文</span>
+                      <button type="button" onClick={() => speakEnglish(message.draft!)} className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><Volume2 size={12} /> 朗读</button>
+                    </div>
+                    <p className="text-[15px] leading-7 text-[var(--ink)]">{message.draft}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+        {sending && (
+          <div className="mr-4 flex w-fit items-center gap-2 rounded-[22px] rounded-bl-md bg-[var(--paper)] px-4 py-3 text-[var(--muted)]">
+            <LoaderCircle size={16} className="animate-spin" /> 正在整理范文…
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {error && <p className="mx-4 mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700">{error}</p>}
+
+      {draft && (
+        <div className="border-t border-[var(--line)] p-3">
+          <div className="mb-2 rounded-2xl bg-[var(--paper)] p-3">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-xs font-semibold text-[var(--green)]">当前范文</span>
+              <button type="button" onClick={() => speakEnglish(draft)} className="flex items-center gap-1 text-[11px] text-[var(--muted)]"><Volume2 size={12} /> 朗读</button>
+            </div>
+            <p className="line-clamp-3 text-sm leading-6 text-[var(--ink)]">{draft}</p>
+          </div>
+          <button type="button" onClick={() => onUseDraft(draft)} className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[var(--green)] p-3.5 font-bold text-white"><Mic size={18} /> 就用这个范文去练习</button>
+        </div>
+      )}
+
+      <div className="border-t border-[var(--line)] p-3">
+        <div className="flex items-end gap-2">
+          <textarea
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void sendIdea();
+              }
+            }}
+            placeholder="用中文说说你的想法，或补充要修改的点…"
+            rows={2}
+            className="max-h-28 min-h-[3.5rem] flex-1 resize-none rounded-2xl bg-[var(--paper)] px-4 py-3 text-[15px] outline-none ring-[var(--mint)] focus:ring-2"
+          />
+          <button type="button" onClick={sendIdea} disabled={sending || !input.trim()} className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[var(--green)] text-white disabled:opacity-35" aria-label="发送">
+            {sending ? <LoaderCircle size={18} className="animate-spin" /> : <Send size={18} />}
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RecorderScreen({ question, referenceAnswer, onCancel, onComplete }: { question: Question; referenceAnswer?: string; onCancel: () => void; onComplete: (result: { transcript: string; audio: Blob; durationSeconds: number; pauseDurationsMs: number[] }) => void }) {
   const [interimTranscript, setInterimTranscript] = useState("");
   const [finalTranscript, setFinalTranscript] = useState("");
   const [transcribing, setTranscribing] = useState(false);
@@ -465,6 +640,15 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
   }, []);
+
+  const speakEnglish = (text: string) => {
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  };
 
   useEffect(() => {
     return () => {
@@ -575,6 +759,15 @@ function RecorderScreen({ question, onCancel, onComplete }: { question: Question
         <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/45">Question</p>
         <p className="text-xl font-medium leading-snug">{question.prompt}</p>
       </div>
+      {referenceAnswer && (
+        <div className="mt-3 rounded-3xl bg-white/[0.12] p-5 ring-1 ring-[var(--lime)]/30">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--lime)]">参考范文 · 照着说</p>
+            <button type="button" onClick={() => speakEnglish(referenceAnswer)} className="flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-[11px]"><Volume2 size={12} /> 朗读</button>
+          </div>
+          <p className="text-sm leading-relaxed text-white/85">{referenceAnswer}</p>
+        </div>
+      )}
       <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
         <div className="relative">
           <button type="button" onClick={recorder.recording ? stopRecording : startRecording} disabled={transcribing} className={`relative z-10 grid size-24 place-items-center rounded-full transition active:scale-95 disabled:opacity-60 ${recorder.recording ? "recording-ring bg-[var(--coral)]" : "bg-[var(--lime)] text-[var(--ink)]"}`} aria-label={recorder.recording ? "停止录音" : "开始录音"}>
