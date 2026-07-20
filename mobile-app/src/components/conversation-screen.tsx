@@ -17,7 +17,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
+import { stopEnglishSpeech, speakEnglishText } from "@/lib/client-tts";
 import { deleteConversation, getConversation, listConversations, saveConversation } from "@/lib/storage";
+import { DEFAULT_TTS_PRESET_ID, getTtsPreset, ttsPresets, type TtsPresetId } from "@/lib/tts-presets";
 import type { ChatMessage, ConversationRecord, ScenarioId } from "@/lib/types";
 import { useRecorder } from "@/lib/use-recorder";
 
@@ -73,14 +75,62 @@ export function ConversationScreen({
   const [listening, setListening] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [sending, setSending] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
+  const [ttsPresetId, setTtsPresetId] = useState<TtsPresetId>(() => {
+    if (typeof window === "undefined") return DEFAULT_TTS_PRESET_ID;
+    const saved = window.localStorage.getItem("speakmate_tts_preset");
+    return ttsPresets.find((item) => item.id === saved)?.id ?? DEFAULT_TTS_PRESET_ID;
+  });
   const [error, setError] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<ConversationRecord[]>([]);
   const [recordId, setRecordId] = useState<string | undefined>(conversationId);
   const nativeRecognitionRef = useRef<NativeSpeechController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const draftRef = useRef("");
+  const interimRef = useRef("");
+  const conversationAbortRef = useRef<AbortController | null>(null);
+  const requestSequenceRef = useRef(0);
+  const speechSequenceRef = useRef(0);
+  const ttsAbortRef = useRef<AbortController | null>(null);
   const recorder = useRecorder();
+  const selectedTtsPreset = getTtsPreset(ttsPresetId);
+
+  const stopSpeaking = useCallback(() => {
+    speechSequenceRef.current += 1;
+    ttsAbortRef.current?.abort();
+    ttsAbortRef.current = null;
+    stopEnglishSpeech();
+    setSpeaking(false);
+  }, []);
+
+  const speak = useCallback((text: string) => {
+    const speechId = ++speechSequenceRef.current;
+    ttsAbortRef.current?.abort();
+    const controller = new AbortController();
+    ttsAbortRef.current = controller;
+    setSpeaking(true);
+    void speakEnglishText(text, {
+      signal: controller.signal,
+      presetId: selectedTtsPreset.id,
+      voice: selectedTtsPreset.voice,
+      style: selectedTtsPreset.style,
+      onStart: () => {
+        if (speechId === speechSequenceRef.current) setSpeaking(true);
+      },
+      onEnd: () => {
+        if (speechId === speechSequenceRef.current) setSpeaking(false);
+        if (ttsAbortRef.current === controller) ttsAbortRef.current = null;
+      },
+    });
+  }, [selectedTtsPreset.id, selectedTtsPreset.style, selectedTtsPreset.voice]);
+
+  const changeTtsPreset = (id: TtsPresetId) => {
+    stopSpeaking();
+    setTtsPresetId(id);
+    window.localStorage.setItem("speakmate_tts_preset", id);
+  };
 
   // 把指定消息列表落库到 IndexedDB，返回（可能的新）记录 id。
   // 不在 effect 里调用，避免链式渲染；只在对话有实质更新时（如收到 AI 回复）调用。
@@ -124,7 +174,9 @@ export function ConversationScreen({
 
   useEffect(() => () => {
     void nativeRecognitionRef.current?.stop();
-    window.speechSynthesis?.cancel();
+    conversationAbortRef.current?.abort();
+    requestSequenceRef.current += 1;
+    stopSpeaking();
     recorder.reset();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -144,11 +196,19 @@ export function ConversationScreen({
     if (record) {
       void nativeRecognitionRef.current?.stop();
       nativeRecognitionRef.current = null;
+      conversationAbortRef.current?.abort();
+      requestSequenceRef.current += 1;
+      stopSpeaking();
+      setSending(false);
+      setListening(false);
+      setTranscribing(false);
       recorder.reset();
       setScenario(record.scenario);
       setMessages(record.messages);
       setRecordId(record.id);
       onConversationChange(record.id);
+      draftRef.current = "";
+      interimRef.current = "";
       setDraft("");
       setInterim("");
       setError("");
@@ -159,12 +219,18 @@ export function ConversationScreen({
   const startNewConversation = (nextScenario: ScenarioId) => {
     void nativeRecognitionRef.current?.stop();
     nativeRecognitionRef.current = null;
-    window.speechSynthesis?.cancel();
+    conversationAbortRef.current?.abort();
+    requestSequenceRef.current += 1;
+    stopSpeaking();
+    setSending(false);
+    setListening(false);
     recorder.reset();
     setScenario(nextScenario);
     setMessages([firstMessage(nextScenario)]);
     setRecordId(undefined);
     onConversationChange("");
+    draftRef.current = "";
+    interimRef.current = "";
     setDraft("");
     setInterim("");
     setError("");
@@ -177,13 +243,9 @@ export function ConversationScreen({
     await refreshHistory();
   };
 
-  const speak = (text: string) => {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 0.92;
-    window.speechSynthesis.speak(utterance);
+  const toggleAutoSpeak = () => {
+    if (autoSpeak) stopSpeaking();
+    setAutoSpeak((value) => !value);
   };
 
   // 切换场景：保留当前对话内容（用户可能想换话题继续），不强制清空。
@@ -192,8 +254,8 @@ export function ConversationScreen({
     setScenario(nextScenario);
   };
 
-  // 把音频上传服务端转写。成功追加到草稿，失败给出可手打的提示。
-  const transcribeAndFill = async (audio: Blob) => {
+  // 把音频上传服务端转写。成功后直接进入发送环节，失败时仍可手动输入。
+  const transcribeAndFill = async (audio: Blob): Promise<string> => {
     setTranscribing(true);
     setError("");
     try {
@@ -203,12 +265,16 @@ export function ConversationScreen({
       const result = (await response.json()) as { text?: string; error?: string };
       const text = (result.text || "").trim();
       if (text) {
-        setDraft((current) => `${current} ${text}`.trim());
+        const next = `${draftRef.current} ${text}`.trim();
+        draftRef.current = next;
+        setDraft(next);
       } else {
         setError(result.error || `没有听清楚（HTTP ${response.status}），可以再试一次或直接打字。`);
       }
+      return text;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "语音转写失败，可以再试一次或直接打字。");
+      return "";
     } finally {
       setTranscribing(false);
     }
@@ -220,19 +286,35 @@ export function ConversationScreen({
       // 浏览器实时识别
       // 原生识别
       if (nativeRecognitionRef.current) {
-        void nativeRecognitionRef.current.stop();
+        await nativeRecognitionRef.current.stop();
         nativeRecognitionRef.current = null;
+        const content = `${draftRef.current} ${interimRef.current}`.trim();
+        interimRef.current = "";
+        setInterim("");
+        setListening(false);
+        if (content) await sendMessage(content);
+        return;
       }
       // MediaRecorder + 服务端 ASR 路径：停止录音后上传转写
       if (recorder.recording) {
         const result = await recorder.stop();
-        if (result) await transcribeAndFill(result.audio);
+        if (result) {
+          const transcript = await transcribeAndFill(result.audio);
+          if (transcript && draftRef.current) await sendMessage(draftRef.current);
+        }
       }
       setListening(false);
       return;
     }
 
+    // 开口即打断：AI 还在生成或朗读时，立即取消旧轮次。
+    conversationAbortRef.current?.abort();
+    conversationAbortRef.current = null;
+    requestSequenceRef.current += 1;
+    stopSpeaking();
+    setSending(false);
     setError("");
+    interimRef.current = "";
     setInterim("");
 
     // APK 内优先用原生识别（体验最实时，不消耗服务端 ASR 额度）
@@ -240,8 +322,15 @@ export function ConversationScreen({
       setListening(true);
       try {
         const nativeRecognition = await startNativeSpeech({
-          onFinal: (text) => setDraft((current) => `${current} ${text}`.trim()),
-          onInterim: setInterim,
+          onFinal: (text) => {
+            const next = `${draftRef.current} ${text}`.trim();
+            draftRef.current = next;
+            setDraft(next);
+          },
+          onInterim: (text) => {
+            interimRef.current = text;
+            setInterim(text);
+          },
           onListeningChange: setListening,
           onError: setError,
         });
@@ -267,8 +356,8 @@ export function ConversationScreen({
     if (ok) setListening(true);
   };
 
-  const sendMessage = async () => {
-    const content = `${draft} ${interim}`.trim();
+  const sendMessage = async (overrideContent?: string) => {
+    const content = (overrideContent ?? `${draftRef.current} ${interimRef.current}`).trim();
     if (!content || sending || transcribing) return;
 
     await nativeRecognitionRef.current?.stop();
@@ -279,6 +368,8 @@ export function ConversationScreen({
       void stopped;
     }
     setListening(false);
+    draftRef.current = "";
+    interimRef.current = "";
     setDraft("");
     setInterim("");
     setError("");
@@ -290,6 +381,10 @@ export function ConversationScreen({
     const nextMessages = [...messages, userMessage];
     setMessages(nextMessages);
     setSending(true);
+    conversationAbortRef.current?.abort();
+    const controller = new AbortController();
+    conversationAbortRef.current = controller;
+    const requestId = ++requestSequenceRef.current;
 
     try {
       const response = await fetch("/api/conversation", {
@@ -299,9 +394,11 @@ export function ConversationScreen({
           scenario,
           messages: nextMessages.map(({ role, content: messageContent }) => ({ role, content: messageContent })),
         }),
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error("对话请求失败，请稍后重试。 ");
       const result = await response.json();
+      if (requestId !== requestSequenceRef.current) return;
       const assistantMessage: ChatMessage = {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -317,9 +414,13 @@ export function ConversationScreen({
       // 显示降级提示（如 MiniMax 失败的原因），便于诊断
       if (result.notice) setError(result.notice);
     } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
       setError(cause instanceof Error ? cause.message : "对话请求失败，请稍后重试。 ");
     } finally {
-      setSending(false);
+      if (requestId === requestSequenceRef.current) setSending(false);
+      if (conversationAbortRef.current === controller) {
+        conversationAbortRef.current = null;
+      }
     }
   };
 
@@ -357,7 +458,24 @@ export function ConversationScreen({
             </button>
           ))}
         </div>
-
+        <div className="mt-3">
+          <div className="mb-2 flex items-center gap-1.5 px-1 text-[11px] font-semibold text-[var(--muted)]">
+            <Volume2 size={12} /> 语音风格
+          </div>
+          <div className="hide-scrollbar flex gap-2 overflow-x-auto">
+            {ttsPresets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => changeTtsPreset(preset.id)}
+                className={`shrink-0 rounded-2xl px-3 py-2 text-left ${ttsPresetId === preset.id ? "bg-[var(--ink)] text-white" : "bg-[var(--paper)]"}`}
+              >
+                <span className="block text-xs font-bold">{preset.label}</span>
+                <span className={`block text-[10px] ${ttsPresetId === preset.id ? "text-white/55" : "text-[var(--muted)]"}`}>{preset.subtitle}</span>
+              </button>
+            ))}
+          </div>
+        </div>
         {showHistory && (
           <div className="mt-4 max-h-64 space-y-2 overflow-y-auto rounded-2xl bg-[var(--paper)] p-2">
             <div className="flex items-center justify-between px-2 py-1">
@@ -428,19 +546,28 @@ export function ConversationScreen({
 
       <div className="border-t border-[var(--line)] bg-white p-3">
         {error && <p className="mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700">{error}</p>}
+        {listening && (
+          <p className="mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs font-medium text-red-700">正在听你说话，再按麦克风即可结束并自动发送</p>
+        )}
         {transcribing && (
           <p className="mb-2 flex items-center gap-1.5 rounded-xl bg-[var(--mint)] px-3 py-2 text-xs text-[var(--green)]">
             <LoaderCircle size={12} className="animate-spin" /> 正在把语音转成文字…
           </p>
         )}
+        {speaking && (
+          <p className="mb-2 rounded-xl bg-[var(--mint)] px-3 py-2 text-xs font-medium text-[var(--green)]">AI 正在说话，点麦克风可以随时打断</p>
+        )}
         {interim && <p className="mb-2 rounded-xl bg-[var(--paper)] px-3 py-2 text-xs italic text-[var(--muted)]">{interim}</p>}
         <div className="flex items-end gap-2">
-          <button type="button" onClick={() => setAutoSpeak((value) => !value)} className={`grid size-11 shrink-0 place-items-center rounded-2xl ${autoSpeak ? "bg-[var(--mint)] text-[var(--green)]" : "bg-[var(--paper)] text-[var(--muted)]"}`} aria-label={autoSpeak ? "关闭自动朗读" : "开启自动朗读"}>
+          <button type="button" onClick={toggleAutoSpeak} className={`grid size-11 shrink-0 place-items-center rounded-2xl ${autoSpeak ? "bg-[var(--mint)] text-[var(--green)]" : "bg-[var(--paper)] text-[var(--muted)]"}`} aria-label={autoSpeak ? "关闭自动朗读" : "开启自动朗读"}>
             {autoSpeak ? <Volume2 size={18} /> : <VolumeX size={18} />}
           </button>
           <textarea
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              draftRef.current = event.target.value;
+              setDraft(event.target.value);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
@@ -454,7 +581,7 @@ export function ConversationScreen({
           <button type="button" onClick={toggleListening} disabled={transcribing} className={`grid size-11 shrink-0 place-items-center rounded-2xl disabled:opacity-50 ${listening || recorder.recording ? "recording-ring bg-[var(--coral)] text-white" : "bg-[var(--mint)] text-[var(--green)]"}`} aria-label={listening || recorder.recording ? "停止语音输入" : "开始语音输入"}>
             {listening || recorder.recording ? <Square size={17} fill="currentColor" /> : <Mic size={19} />}
           </button>
-          <button type="button" onClick={sendMessage} disabled={sending || transcribing || (!draft.trim() && !interim.trim())} className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[var(--green)] text-white disabled:opacity-35" aria-label="发送消息">
+          <button type="button" onClick={() => void sendMessage()} disabled={sending || transcribing || (!draft.trim() && !interim.trim())} className="grid size-11 shrink-0 place-items-center rounded-2xl bg-[var(--green)] text-white disabled:opacity-35" aria-label="发送消息">
             {sending ? <LoaderCircle size={18} className="animate-spin" /> : <Send size={18} />}
           </button>
         </div>

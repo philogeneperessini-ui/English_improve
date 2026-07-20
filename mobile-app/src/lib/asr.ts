@@ -17,6 +17,8 @@ export type AsrResult = {
   source: "siliconflow" | "demo";
 };
 
+export const DEFAULT_ASR_MODEL = "FunAudioLLM/SenseVoiceSmall";
+
 export class AsrNotConfiguredError extends Error {
   constructor() {
     super("未配置语音转写服务。请在服务端设置 SILICONFLOW_API_KEY 后重试。");
@@ -26,6 +28,14 @@ export class AsrNotConfiguredError extends Error {
 
 export function isAsrConfigured() {
   return Boolean(process.env.SILICONFLOW_API_KEY);
+}
+
+export function getAsrConfig() {
+  return {
+    configured: isAsrConfigured(),
+    baseUrl: (process.env.SILICONFLOW_BASE_URL || "https://api.siliconflow.cn/v1").replace(/\/$/, ""),
+    model: process.env.ASR_MODEL || DEFAULT_ASR_MODEL,
+  };
 }
 
 /**

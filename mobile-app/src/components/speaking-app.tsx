@@ -30,6 +30,7 @@ import { ConversationScreen } from "@/components/conversation-screen";
 import { AuthLogoutButton } from "@/components/auth-gate";
 import { getDailyQuestion, partTips, questions } from "@/lib/questions";
 import { analyzeSpeech } from "@/lib/metrics";
+import { speakEnglishText } from "@/lib/client-tts";
 import { startNativeSpeech, type NativeSpeechController } from "@/lib/native-speech";
 import { deletePractice, listConversations, listPractices, savePractice } from "@/lib/storage";
 import { useRecorder } from "@/lib/use-recorder";
@@ -494,12 +495,7 @@ function CoachScreen({ question, referenceAnswer, onCancel, onUseDraft }: { ques
   }, [messages, sending]);
 
   const speakEnglish = (text: string) => {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 0.9;
-    window.speechSynthesis.speak(utterance);
+    void speakEnglishText(text);
   };
 
   const sendIdea = async () => {
@@ -642,12 +638,7 @@ function RecorderScreen({ question, referenceAnswer, onCancel, onComplete }: { q
   }, []);
 
   const speakEnglish = (text: string) => {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 0.9;
-    window.speechSynthesis.speak(utterance);
+    void speakEnglishText(text);
   };
 
   useEffect(() => {
@@ -829,12 +820,7 @@ function SpeechMetricStrip({ metrics }: { metrics: SpeechMetrics }) {
 function ResultScreen({ record, onRetry, onClose }: { record: PracticeRecord; onRetry: () => void; onClose: () => void }) {
   const { evaluation } = record;
   const speak = () => {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(evaluation.improvedAnswer);
-    utterance.lang = "en-US";
-    utterance.rate = 0.9;
-    window.speechSynthesis.speak(utterance);
+    void speakEnglishText(evaluation.improvedAnswer);
   };
 
   return (
